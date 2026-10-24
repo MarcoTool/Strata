@@ -2,7 +2,9 @@
 
 ## Purpose
 
-`RowRelay` 在 `dst_dev` 擁有一塊 `piece * row_floats` 的 device buffer。`wrap(fn)` 產生的 callback 會把位於 `src_dev` 的 rows 分段 peer-copy 到這塊 buffer，並在 `dst_dev` context 下依序呼叫 `fn`。類別不可複製、可以 move，析構時釋放 buffer。
+`RowRelay` owns a device buffer of `piece * row_floats` floats on `dst_dev`. The callback returned by `wrap(fn)`
+peer-copies rows that live on `src_dev` into this buffer piece by piece, and calls `fn` for each piece in the
+`dst_dev` context. The class is move-only; the destructor frees the buffer.
 
 ## Signature
 
@@ -27,43 +29,51 @@ public:
 
 ## Inputs
 
-`RowRelay::init`：
+`RowRelay::init`:
 
-- `src_dev`：`R_rows` 所在的來源 CUDA device ordinal，無單位。
-- `dst_dev`：relay buffer 與 wrapped callback 執行所在的 CUDA device ordinal，無單位。
-- `row_floats`：每列的 `float` 數，單位為 float element。
-- `piece`：單次最多搬移的列數，單位為 row；gfx906 split-prefill 的典型值為 `1024`。
-- `err`：host 端錯誤字串，由呼叫者持有；進入 `init` 時會清空。
+- `src_dev`: CUDA device ordinal that holds `R_rows`.
+- `dst_dev`: CUDA device ordinal of the relay buffer, where the wrapped callback runs.
+- `row_floats`: floats per row.
+- `piece`: maximum rows moved per copy; `1024` in the gfx906 split prefill.
+- `err`: host error string owned by the caller; cleared on entry.
 
-`RowRelay::wrap`：
+`RowRelay::wrap`:
 
-- `fn`：由呼叫者提供並以 value 捕捉的 `ChunkFn`；每段會收到位於 `dst_dev` 的暫存 rows、該段列數與修正後的起始位置。callback 可在呼叫間保存自身 host state，但不得取得 relay buffer 的所有權。
+- `fn`: a `ChunkFn` supplied by the caller and captured by value. Each piece receives the staged rows on `dst_dev`,
+  the number of rows in the piece and the adjusted start position. The callback may keep its own host state between
+  calls but must not take ownership of the relay buffer.
 
-wrapped `ChunkFn`：
+The wrapped `ChunkFn`:
 
-- `R_rows`：位於 `src_dev` 的 device pointer，資料排列為 `T * row_floats` 個連續 `float`；不取得所有權。`T == 0` 時可為 null。
-- `T`：輸入列數，單位為 row，必須非負。
-- `pos0`：第一列的 logical token position，單位為 position；第 `a` 段傳給 `fn` 的值為 `pos0 + a`。
-- `err`：host 端錯誤字串，由呼叫者持有；wrapped callback 進入時會清空，之後 relay 或 `fn` 可寫入。
+- `R_rows`: device pointer on `src_dev` to `T * row_floats` contiguous floats; not owned. May be null when `T == 0`.
+- `T`: number of input rows; must be non-negative.
+- `pos0`: logical token position of the first row; the piece starting at row `a` passes `pos0 + a` to `fn`.
+- `err`: host error string owned by the caller; cleared when the wrapped callback is entered, then written by the
+  relay or by `fn`.
 
 ## Outputs
 
-`init` 成功配置 buffer 時回傳 `true`；失敗回傳 `false`，並保留原本已初始化的 buffer。再次成功 `init` 會釋放舊 buffer並換成新配置。`wrap` 回傳新的 `ChunkFn`。wrapped callback 成功處理所有列時回傳 `true`，copy 或下游 callback 失敗時回傳 `false`。
+`init` returns `true` when the buffer is allocated and `false` on failure, keeping any buffer from an earlier
+successful `init`. A second successful `init` frees the old buffer and replaces it. `wrap` returns a new `ChunkFn`. The
+wrapped callback returns `true` when every row is processed and `false` when a copy or the downstream callback fails.
 
-move construction/assignment 轉移 device buffer 所有權；moved-from 物件回到未初始化狀態。析構與 move assignment 會在原 `dst_dev` context 呼叫 `cudaFree`。每次呼叫下游 `fn` 前，relay buffer 的內容會被當前 chunk 覆寫。
+Move construction and move assignment transfer ownership of the device buffer; the moved-from object returns to the
+uninitialized state. The destructor and move assignment call `cudaFree` in the original `dst_dev` context. The buffer
+contents are overwritten by the current piece before each call to `fn`.
 
 ## Preconditions
 
-- `src_dev >= 0`、`dst_dev >= 0`、`row_floats > 0`、`piece > 0`，且乘積可由 `size_t` 表示。
-- 呼叫 wrapped callback 前 `init` 已成功，且 `fn` 非空。
-- `R_rows` 的 device allocation 至少包含 `T * row_floats * sizeof(float)` bytes，並位於 `src_dev`。
-- `T * row_floats` 必須可由 `size_t` 表示，且 `T > 0` 時 `pos0 + T - 1` 必須可由 `int64_t` 表示。
-- CUDA peer access 已設定。
-- `RowRelay` 的 buffer owner 必須活得比所有由它建立且仍會被呼叫的 wrappers 更久；move 不改變 buffer address，但 owner 析構後 wrapper 即不可再使用。
+- `src_dev >= 0`, `dst_dev >= 0`, `row_floats > 0`, `piece > 0`, and their product fits in `size_t`.
+- `init` has succeeded and `fn` is not empty before the wrapped callback is called.
+- The allocation behind `R_rows` holds at least `T * row_floats * sizeof(float)` bytes on `src_dev`.
+- `T * row_floats` fits in `size_t`, and for `T > 0`, `pos0 + T - 1` fits in `int64_t`.
+- CUDA peer access is enabled.
+- The `RowRelay` that owns the buffer outlives every wrapper created from it that may still be called. A move does not
+  change the buffer address, but no wrapper may be used after the owner is destroyed.
 
 ## Errors
 
-此元件產生下列 `err`：
+This component writes the following to `err`:
 
 - `RowRelay::init: src_dev must be non-negative`
 - `RowRelay::init: dst_dev must be non-negative`
@@ -80,21 +90,31 @@ move construction/assignment 轉移 device buffer 所有權；moved-from 物件�
 - `RowRelay::wrap: peer copy failed`
 - `RowRelay::wrap: callback failed`
 
-若下游 `fn` 回傳 `false` 且已填入 `err`，relay 會保留該訊息；只有在 `err` 為空時才寫入 `RowRelay::wrap: callback failed`。析構與 move cleanup 無法回報 `cudaFree` 錯誤。
+When the downstream `fn` returns `false` and has set `err`, the relay keeps that message; it writes
+`RowRelay::wrap: callback failed` only when `err` is empty. The destructor and move cleanup cannot report `cudaFree`
+errors.
 
 ## Threading/streams
 
-wrapped callback 使用同步 `cudaMemcpyPeer`，沒有接受 stream，也不會自行做 stream synchronization。copy 與 `fn` 都在 `core::OnDevice(dst_dev)` scope 內依序執行。單一 `RowRelay` 只有一塊共用 buffer，因此其 wrappers 不可同時呼叫；若需併行，應為每條執行路徑建立獨立 relay。
+The wrapped callback uses the synchronous `cudaMemcpyPeer`; it takes no stream and does no stream synchronization of
+its own. The copy and `fn` run in order inside a `core::OnDevice(dst_dev)` scope. A `RowRelay` has a single shared
+buffer, so its wrappers must not be called concurrently; use one relay per concurrent path.
 
+Caller responsibilities:
 
-**呼叫端責任（整合時補註）：**
-
-- `wrap()` 回傳的 callback 只捕捉 buffer 的裸指標，**`RowRelay` 物件必須活得比所有 wrapper 久**；relay 先被解構後再呼叫 wrapper 是未定義行為。
-- `R_rows` 若是在 non-blocking stream 上產生，`cudaMemcpyPeer` 走 null stream **不會**等那條 stream；呼叫 wrapper 前，產生 rows 的 stream 必須已經同步。Strata prefill 呼叫 `on_chunk` 前會先 `cudaStreamSynchronize(m.cs)`（`src/prefill/prefill.cpp`，`on_chunk(m.R, T, p0, err)` 那段），因此用作 `Prefill::on_chunk` 時不需額外同步。
+- The callback returned by `wrap()` captures only a raw pointer to the buffer, so **the `RowRelay` must outlive every
+  wrapper**. Calling a wrapper after the relay is destroyed is undefined behavior.
+- If `R_rows` is produced on a non-blocking stream, `cudaMemcpyPeer` on the null stream does **not** wait for it; the
+  producing stream must be synchronized before the wrapper is called. Strata's prefill calls
+  `cudaStreamSynchronize(m.cs)` before `on_chunk` (`src/prefill/prefill.cpp`, at `on_chunk(m.R, T, p0, err)`), so no
+  extra synchronization is needed when the wrapper is used as `Prefill::on_chunk`.
 
 ## Cost
 
-常駐 device memory 為 `piece * row_floats * sizeof(float)` bytes。處理 `T` 列會 peer-copy `T * row_floats * sizeof(float)` bytes，執行 `ceil(T / piece)` 次 copy 與相同次數的 `fn`。例如 `piece = 1024`、`row_floats = 10240` 時，buffer 約為 40 MiB；處理 2500 列會分成 1024、1024、452 三段。
+Resident device memory is `piece * row_floats * sizeof(float)` bytes. Processing `T` rows peer-copies
+`T * row_floats * sizeof(float)` bytes in `ceil(T / piece)` copies, with the same number of calls to `fn`. For example,
+with `piece = 1024` and `row_floats = 10240` the buffer is about 40 MiB, and 2,500 rows are processed as pieces of
+1024, 1024 and 452.
 
 ## Example call
 
