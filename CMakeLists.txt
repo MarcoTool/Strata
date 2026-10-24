@@ -601,7 +601,7 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_link_libraries(tune_hipblaslt PRIVATE hip::host roc::hipblas roc::hipblaslt)
   endif()
 
-  add_executable(strata src/program/generate.cpp)
+  add_executable(strata src/program/generate.cpp src/gfx906/split_handoff.cpp src/gfx906/row_relay.cpp)
   target_include_directories(strata PRIVATE ${_strata_gpu_include_directories})
   target_link_libraries(strata PRIVATE strata_engine strata_prefill strata_spec ${_strata_gpu_runtime_target})
 
@@ -1036,6 +1036,14 @@ if(STRATA_ENABLE_CUDA OR STRATA_ENABLE_HIP)
     target_include_directories(native_mmvq_multi PRIVATE ${_strata_gpu_include_directories})
     target_link_libraries(native_mmvq_multi PRIVATE strata_kernels ${_strata_gpu_runtime_target})
     add_test(NAME native_mmvq_multi COMMAND native_mmvq_multi --selftest)
+  endif()
+
+  # gfx906: what splitting a GDN block over two cards buys, handoffs included (STRATA_GFX906 expert/tensor parallel work)
+  if(STRATA_HIP_GFX906)
+    add_executable(tp_gdn_probe tools/hip/tp_gdn_probe.cpp)
+    set_source_files_properties(tools/hip/tp_gdn_probe.cpp PROPERTIES LANGUAGE HIP)
+    target_include_directories(tp_gdn_probe PRIVATE ${_strata_gpu_include_directories})
+    target_link_libraries(tp_gdn_probe PRIVATE strata_kernels ${_strata_gpu_runtime_target})
   endif()
 
   # Plan v0.3 P0.1: working-set lock of a host region (CPU only).

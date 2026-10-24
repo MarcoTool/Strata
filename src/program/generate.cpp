@@ -101,6 +101,8 @@
 #include <chrono>
 #include <algorithm>
 #include <memory>
+#include "strata/gfx906/row_relay.hpp"
+#include "strata/gfx906/split_handoff.hpp"
 #include <iostream>
 #include <functional>
 #include <future>
@@ -12554,6 +12556,9 @@ int main(int argc, char** argv) {
     int64_t pos_start = 0;
     int64_t spec_pos = 0;   // plan v0.3 P6: where the speculative loop starts (0 = not used)
     strata::prefill::Prefill prefill;
+    std::unique_ptr<GpuStage> pf1;   // STRATA_GFX906_SPLIT_PREFILL: the later layers' prompt path on the remote tier's card
+    strata::gfx906::RowRelay pf1_relay;   // its final rows to CUDA0's drafter; doc: docs/fn/RowRelay.md
+    std::vector<int32_t> pf1_res;         // its residency: the remote tier's slots for [L, n_layers), the rest streamed
     // #1595: not by default when the cache holds every expert (nothing to take)
     strata::prefill::Prefill::arm_cpu_share(!multi_gpu && !o.no_pool,
         !multi_gpu && !o.no_pool && o.batch <= 0 &&
@@ -12606,6 +12611,80 @@ int main(int argc, char** argv) {
         }
         if (borrow == nullptr)
             std::fprintf(stderr, "strata generate: prompt path allocates its own buffers (no cache slots to borrow)\n");
+        // gfx906-ep (STRATA_GFX906_SPLIT_PREFILL=L, docs/GFX906_SPLIT_PREFILL.md): the prompt read as a layer split
+        // onto the remote tier's card - CUDA0 reads layers [0, L) of each chunk and hands its rows to a prompt path on
+        // that card for [L, n_layers), the two pipelined as a split's stages are - and the decode as before (CUDA0's
+        // dense layers, the remote tier's experts).  The later layers' state the prompt leaves on that card moves into
+        // CUDA0's session after the read (split_handoff below).
+        if (const char* v = std::getenv("STRATA_GFX906_SPLIT_PREFILL"); v != nullptr && std::atoi(v) > 0) {
+            const int64_t L = std::atoi(v);
+            const char* why = multi_gpu ? "not with a layer split"
+                            : o.expert_cache_remote[0] <= 0 ? "it needs --expert-cache-device1"
+                            : L >= g.n_layers ? "the layer is past the model's last" : nullptr;
+            if (why != nullptr) {
+                std::fprintf(stderr, "strata generate: STRATA_GFX906_SPLIT_PREFILL is off (%s)\n", why);
+            } else {
+                pf1 = std::make_unique<GpuStage>();
+                GpuStage& st = *pf1;
+                st.dev = remote_dev[0];
+                st.lb = L;
+                st.le = g.n_layers;
+                const strata::core::OnDevice on(st.dev);
+                if (!load_stage_weights(st, st.lb, st.le, true)) return 1;
+                strata::core::NativeDense::set_layer_range(-1, -1);   // process-wide: back to every layer
+                if (cudaStreamCreateWithFlags(&st.stream, cudaStreamNonBlocking) != cudaSuccess) {
+                    std::fprintf(stderr, "strata generate: split prefill, CUDA%d: its stream failed\n", st.dev);
+                    return 1;
+                }
+                if (!strata::kernels::cvec_replicate(err)) {   // the control vector's tables: its layers apply it there
+                    std::fprintf(stderr, "strata generate: split prefill, CUDA%d: %s\n", st.dev, err.c_str());
+                    return 1;
+                }
+                void* sb1 = nullptr;
+                if (cudaMalloc(&sb1, strata::core::session_bytes(g, o.max_context, K, st.lb, st.le)) != cudaSuccess ||
+                    strata::core::session_init(g, o.max_context, K, sb1, st.ss, st.lb, st.le) == 0) {
+                    std::fprintf(stderr, "strata generate: split prefill, CUDA%d: the session state failed%s\n", st.dev,
+                                 vram_free_note().c_str());
+                    return 1;
+                }
+                strata::core::session_zero(st.ss, g, nullptr, st.stream);
+                st.sp.set_stage(st.lb, -1, nullptr);
+                // its experts: the ones the remote tier already holds on this card are read in place (the tier is
+                // idle while a prompt is read), the rest streamed from the pinned arena over this card's link
+                const strata::core::ExpertCache* pf1_cache = nullptr;
+                int64_t held = 0;
+                if (std::getenv("STRATA_GFX906_SPLIT_PREFILL_STREAM") == nullptr) {
+                    pf1_cache = &remote_experts[0].cache();
+                    pf1_res.assign((size_t) (g.n_layers * g.n_expert), strata::core::kNotResident);
+                    for (int64_t l = st.lb; l < st.le; ++l)
+                        for (int64_t e = 0; e < g.n_expert; ++e) {
+                            const int32_t sl = pf1_cache->slot_of(l, (int32_t) e);
+                            if (sl < 0) continue;
+                            pf1_res[(size_t) (l * g.n_expert + e)] = sl;
+                            ++held;
+                        }
+                }
+                std::fprintf(stderr, "strata generate: split prefill: CUDA%d holds %lld of the %lld experts of its "
+                                     "layers\n", st.dev, (long long) held, (long long) ((st.le - st.lb) * g.n_expert));
+                if (!st.sp.init(st.wt, g, st.ss, srcp, pf1_cache, pf1_cache ? pf1_res.data() : nullptr, o.prefill_chunk,
+                                (void*) st.stream, err)) {
+                    std::fprintf(stderr, "strata generate: split prefill, CUDA%d prompt path: %s%s\n", st.dev, err.c_str(),
+                                 vram_free_note().c_str());
+                    return 1;
+                }
+                if (cudaStreamSynchronize(st.stream) != cudaSuccess) {
+                    std::fprintf(stderr, "strata generate: split prefill, CUDA%d: the session zero failed\n", st.dev);
+                    return 1;
+                }
+                prefill.set_stage(0, st.lb, &st.sp);
+                size_t fb = 0, tb = 0;
+                cudaMemGetInfo(&fb, &tb);
+                std::fprintf(stderr, "strata generate: split prefill: CUDA0 reads layers 0-%lld of the prompt, CUDA%d "
+                                     "layers %lld-%lld (its experts streamed); %.2f GiB free there\n",
+                             (long long) st.lb - 1, st.dev, (long long) st.lb, (long long) st.le - 1,
+                             (double) fb / 1073741824.0);
+            }
+        }
         if (!multi_gpu && !o.no_pool) prefill.set_cpu_pool(&pool);
         if (!prefill.init(wt, g, ss, srcp, o.expert_cache > 0 ? &xcache : nullptr,
                           host_res.empty() ? nullptr : host_res.data(), o.prefill_chunk, main_cs, err, borrow,
@@ -12626,6 +12705,15 @@ int main(int argc, char** argv) {
                 return e.empty() && mtp.prefill(R_rows, nxt.data(), T, p0, e);
             };
         }
+        if (pf1 && prefill.on_chunk) {
+            // the last stage calls on_chunk with the chunk's final rows on ITS card; the drafter reads them on CUDA0
+            if (!pf1_relay.init(pf1->dev, 0, g.hc * g.n_embd, 1024, err)) {   // doc: docs/fn/RowRelay.md
+                std::fprintf(stderr, "strata generate: split prefill: %s\n", err.c_str());
+                return 1;
+            }
+            pf1->sp.on_chunk = pf1_relay.wrap(std::move(prefill.on_chunk));
+            prefill.on_chunk = nullptr;
+        }
         if (!kvg_started) {   // the elastic K/V: every cell this run can reach (no loan)
             kvg_started = true;
             kvg_start(xcache.slots());
@@ -12635,6 +12723,20 @@ int main(int argc, char** argv) {
         if (!prefill.run(o.tokens.data(), n_batched, 0, err)) {
             std::fprintf(stderr, "strata generate: %s\n", err.c_str());
             return 1;
+        }
+        if (pf1) {
+            // gfx906-ep: layers [L, n_layers) of the prompt live in the remote tier card's session; the decode reads
+            // them from CUDA0's.  doc: docs/fn/split_handoff_layers.md
+            strata::gfx906::HandoffStats hs;
+            if (!strata::gfx906::split_handoff_layers(pf1->ss, pf1->dev, (void*) pf1->stream, ss, 0, main_cs, g, pf1->lb,
+                                                      pf1->le, n_batched, hs, err)) {
+                std::fprintf(stderr, "strata generate: split prefill: %s\n", err.c_str());
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: split prefill: layers %lld-%lld (%lld GDN, %lld QSA) moved to CUDA0 "
+                                 "(%.1f MiB) in %.0f ms\n",
+                         (long long) pf1->lb, (long long) pf1->le - 1, (long long) hs.gdn_layers, (long long) hs.qsa_layers,
+                         (double) hs.bytes / 1048576.0, hs.ms);
         }
         // refill the lent slots from the arena and give them back to the decode tier
         if (!lent.empty()) {

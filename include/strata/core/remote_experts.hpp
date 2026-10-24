@@ -47,6 +47,8 @@ public:
     int64_t computed() const { return computed_; }
     int64_t launched_layers() const { return launched_layers_; }
     double gib() const { return cache_.gib(); }
+    /// gfx906-ep split prefill: the later layers' prompt path on this GPU reads the blobs this cache holds in place
+    const ExpertCache& cache() const { return cache_; }
     uint64_t returned_bytes() const { return returned_bytes_; }
     uint64_t full_row_bytes() const { return full_row_bytes_; }
     /// host time spent in begin() (staging + launches) and in finish() (waiting for this GPU), cumulative
