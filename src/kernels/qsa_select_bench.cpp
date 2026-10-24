@@ -68,7 +68,8 @@ int main(int argc, char** argv) {
     ck(cudaMalloc(&sc_new, (size_t) (nq * max_blocks) * 4), "malloc");
     ck(cudaMalloc(&ids_old, (size_t) (nq * cap) * 4), "malloc");
     ck(cudaMalloc(&ids_new, (size_t) (nq * cap) * 4), "malloc");
-    const int64_t active = steps[(size_t) ((nq - 1) * k::kStepCount + k::kStepNBid)] + 1;
+    // BENCH_DECODE=1: the decode dispatch (no active-block count: the capacity rule), as a captured window calls it
+    const int64_t active = std::getenv("BENCH_DECODE") ? 0 : steps[(size_t) ((nq - 1) * k::kStepCount + k::kStepNBid)] + 1;
     auto run_old = [&] { k::qsa_block_scores(d_pooled, d_dead, d_q, d_steps, nq, max_blocks, s, sc_old, nullptr, active); };
     // a device without the tensor-core scorer (HIP other than gfx12): time the warp scorer and the top-k only
     const bool have_tc = k::qsa_block_scores_tc(d_pooled, d_dead, d_q, d_steps, 1, max_blocks, s, sc_new, nullptr, active);

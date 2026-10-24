@@ -338,7 +338,17 @@ bool RemoteExperts::finish(float* out, std::string& err) {
     DeviceScope scope(device_);
     if (!scope.ok) { err = scope.error(device_); return false; }
     const auto w0 = std::chrono::steady_clock::now();
-    if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) return false;
+    // gfx906-ep (STRATA_GFX906_REMOTE_POLL=1): the layer waits for this GPU on the critical path; poll the stream
+    // instead of a blocking sync, whose wake-up HIP's scheduling flags may not shorten (cudaInitDevice's spin flag is
+    // dropped once the device's context exists)
+    static const bool poll = [] { const char* v = std::getenv("STRATA_GFX906_REMOTE_POLL"); return v && v[0] == '1'; }();
+    if (poll) {
+        cudaError_t q;
+        while ((q = cudaStreamQuery(stream_)) == cudaErrorNotReady) {}
+        if (!check(q, "finish (poll)", err, device_)) return false;
+    } else if (!check(cudaStreamSynchronize(stream_), "finish", err, device_)) {
+        return false;
+    }
     ms_wait_ += std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - w0).count();
     if (remote_opt_ && remote_opt_->active()) { remote_opt_->accumulate(*this); return true; }
     for (size_t i = 0; i < original_row_.size(); ++i)
