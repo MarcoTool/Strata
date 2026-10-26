@@ -34,6 +34,20 @@ bool conversation_kv_verify(const ConversationKv& image, const QsaState& state, 
 // conversation_kv_save).  Caller synchronizes the device first and keeps the state untouched while it is read.
 bool conversation_kv_source(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
                             int64_t upto, bool include_index, std::string& error);
+// Incremental session files (the PD split hands the session over every turn, and the reader already holds the
+// conversation up to `base`): the bytes of each part that stay as the reader has them - the whole pages before `base`
+// and the indexer rows before its block, as conversation_kv_save keeps them for an unchanged prefix.
+bool conversation_kv_keep(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
+                          int64_t base, std::array<size_t, 5>& keep, std::string& error);
+// conversation_kv_source with `from` set to those bytes: only the tail goes into the file.
+bool conversation_kv_source_from(SessionKvSource& source, const QsaState& state, const ModelGeometry& g,
+                                 int64_t upto, bool include_index, int64_t base, std::string& error);
+// An image read from an incremental file holds each part's tail only: checked against this state (no device write),
+// then copied behind the kept bytes.
+bool conversation_kv_validate_tail(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                                   int64_t upto, bool include_index, int64_t base, std::string& error);
+bool conversation_kv_restore_tail(const ConversationKv& image, const QsaState& state, const ModelGeometry& g,
+                                  int64_t upto, bool include_index, int64_t base, std::string& error);
 // The bytes of each K/V part (k, v, k_scale, v_scale, pooled) a snapshot of `upto` tokens holds: no state read.
 bool conversation_kv_part_sizes(const QsaState& state, const ModelGeometry& g, int64_t upto, bool include_index,
                                 std::array<uint64_t, 5>& sizes, std::string& error);
@@ -89,12 +103,25 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
                                    const ModelGeometry& g, const QsaState& draft, std::string& error);
 bool conversation_snapshot_validate(const SavedConversation& image, const SessionState& session,
                                     const ModelGeometry& g, const QsaState& draft, std::string& error);
+// Incremental session files: sources whose K/V parts start at `base` (the draft one token earlier, as
+// conversation_snapshot_save refreshes its last page), and the matching validation of an image read from such a file.
+// The caller checks that its live session holds the image's first `base` tokens before it restores.
+bool conversation_snapshot_sources_from(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                        const ConversationView& view, const SessionState& session,
+                                        const ModelGeometry& g, const QsaState& draft, int64_t base,
+                                        std::string& error);
+bool conversation_snapshot_validate_tail(const SavedConversation& image, int64_t base, const SessionState& session,
+                                         const ModelGeometry& g, const QsaState& draft, std::string& error);
 enum class ConversationRestore { restored, invalid, transfer_failed };
 // Invalid images are rejected before any CUDA call/write. Transfer failure may
 // leave partial state: caller MUST NOT continue inference from that session.
 ConversationRestore conversation_snapshot_restore(const SavedConversation& image, SessionState& session,
                                                    const ModelGeometry& g, const QsaState& draft,
                                                    std::string& error);
+// The incremental form: the running state and checkpoints whole, each K/V part's tail behind the kept bytes.
+ConversationRestore conversation_snapshot_restore_tail(const SavedConversation& image, int64_t base,
+                                                        SessionState& session, const ModelGeometry& g,
+                                                        const QsaState& draft, std::string& error);
 
 // The same with `draft == nullptr`: an image WITHOUT the draft layer's K/V (kv holds the session's own QSA layers
 // only).  A layer split's later stages park this way; the draft ring is saved once, with the first stage's image.

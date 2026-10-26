@@ -651,9 +651,10 @@ struct Out {
     // a K/V part pulled from its owner straight into the file block (sizing pass: counted, never read)
     void source(const SessionKvSource& s, size_t part) {
         const size_t size = s.sizes[part];
-        u64(size);
-        if (!f) { count(size); return; }
-        for (size_t at = 0; at < size && ok;) {
+        const size_t from = std::min(s.from[part], size);   // incremental files write the tail only
+        u64(size - from);
+        if (!f) { count(size - from); return; }
+        for (size_t at = from; at < size && ok;) {
             size_t room = 0;
             uint8_t* d = f->span(room);
             const size_t c = std::min(room, size - at);
@@ -803,7 +804,7 @@ bool has_stage_parts(const SavedConversation& s) {
 
 // header v1, little-endian: magic[8] version:u32 header_size:u32 model:u64 config:u64 payload:u64 reserved:u64[2]
 // header_hash:u64 (session_hash64 of bytes 0..55, seed 0)
-void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
+void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload, uint64_t delta_base = 0) {
     std::memset(h, 0, kHeader);
     std::memcpy(h, kMagic, 8);
     const uint32_t version = kVersion, size = kHeader;
@@ -812,6 +813,7 @@ void header_bytes(uint8_t* h, const SessionFileIdentity& id, uint64_t payload) {
     std::memcpy(h + 16, &id.model, 8);
     std::memcpy(h + 24, &id.config, 8);
     std::memcpy(h + 32, &payload, 8);
+    std::memcpy(h + 40, &delta_base, 8);   // reserved[0]: an incremental file's base, 0 for a whole session
     const uint64_t hh = session_hash64(h, 56, 0);
     std::memcpy(h + 56, &hh, 8);
 }
@@ -1031,6 +1033,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     st.error = SessionError::invalid;   // refusals before any disk access
     if (has_stage_parts(image)) { error = "session file: layer-split state cannot be saved"; return false; }
     if (sources && !image.kv.empty()) { error = "session file: K/V given both in the image and as sources"; return false; }
+    if (opt.delta_base && !sources) { error = "session file: an incremental file needs K/V sources"; return false; }
     Out sizing;
     put_payload(sizing, image, sources);
     if (sizing.overflow || sizing.n > UINT64_MAX - kHeader - kTrailer ||
@@ -1069,7 +1072,7 @@ bool write_impl(const std::string& path, const SavedConversation& image, const s
     f.write_fault = injected(fault, "write");
     f.flush_fault = injected(fault, "file_flush");
     uint8_t h[kHeader];
-    header_bytes(h, id, payload);
+    header_bytes(h, id, payload, opt.delta_base);
     bool ok = f.write(h, kHeader);
     SessionHasher hash(0);
     Out out;
@@ -1205,7 +1208,8 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     if (std::memcmp(h, kMagic, 8) != 0) { error = "session file: not a Strata session file (magic)"; return false; }
     if (hh != session_hash64(h, 56, 0)) { error = "session file: header checksum mismatch"; return false; }
     if (version != kVersion) { error = "session file: unsupported version " + std::to_string(version); return false; }
-    if (hsize != kHeader || r0 || r1) { error = "session file: invalid header fields"; return false; }
+    if (hsize != kHeader || r1) { error = "session file: invalid header fields"; return false; }
+    if (r0 && !limits.allow_delta) { error = "session file: an incremental file (it needs the session it continues)"; return false; }
     if (model != id.model) { error = "session file: saved with another model (model fingerprint differs)"; return false; }
     if (config != id.config) { error = "session file: saved with another engine configuration (config fingerprint differs)"; return false; }
     if (payload > size || size - kHeader - kTrailer != payload) {
@@ -1234,6 +1238,7 @@ bool read_impl(const std::string& path, const SessionFileIdentity& id, SavedConv
     image = std::move(parsed);
     bytes = (size_t) size;
     st.error = SessionError::none;
+    st.delta_base = r0;
     return true;
 }
 } // namespace

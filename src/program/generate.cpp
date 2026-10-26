@@ -9897,9 +9897,23 @@ int main(int argc, char** argv) {
             // (fingerprint file, state capture, file flush, rename + folder flush, validation, device transfer):
             // that step is allowed <seconds> (session_phase_limit_s) by the watchdog and by the server, no more.
             // (A verifier commit that fails before the command still answers ERR and exits, as for a request.)
-            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0) {
+            // SAVEFROM <tokens> <path>: an incremental file for a reader that already holds this conversation up to
+            // <tokens> (the PD split's decode engine): only the K/V past the pages before it is written, the running
+            // state and checkpoints whole.  RESTORE takes either kind; an incremental one is applied only when the live
+            // session holds the file's first <base> tokens (and images), else it is refused and nothing changes.
+            if (line.rfind("SAVE ", 0) == 0 || line.rfind("RESTORE ", 0) == 0 || line.rfind("SAVEFROM ", 0) == 0) {
                 const bool save = line[0] == 'S';
-                const std::string path = line.substr(save ? 5 : 8);
+                const bool save_from = line.rfind("SAVEFROM ", 0) == 0;
+                long long from_tokens = 0;
+                std::string path;
+                if (save_from) {
+                    char* endp = nullptr;
+                    from_tokens = std::strtoll(line.c_str() + 9, &endp, 10);
+                    path = endp && *endp == ' ' ? std::string(endp + 1) : std::string();
+                    if (from_tokens < 0) path.clear();
+                } else {
+                    path = line.substr(save ? 5 : 8);
+                }
                 const auto t0 = Clock::now();
                 auto ms = [&] { return std::chrono::duration<double, std::milli>(Clock::now() - t0).count(); };
                 auto refuse = [&](const std::string& why, strata::core::SessionError kind = strata::core::SessionError::invalid,
@@ -9954,6 +9968,7 @@ int main(int argc, char** argv) {
                     if (!live_ok || live.empty()) { refuse("no complete session to save"); continue; }
                     size_t bytes = 0, kept = 0;
                     double capture_ms = 0;
+                    int64_t saved_base = 0;
                     try {
                         // RAM PREFLIGHT for the save (not a reservation), BEFORE anything is copied: the deepest
                         // checkpoint is chosen by reference, and the copies it will take (the list below and the one
@@ -10010,15 +10025,25 @@ int main(int argc, char** argv) {
                         const strata::core::ConversationView view{live, live_imgs, disk_checks, cvec_cached};
                         strata::core::SavedConversation meta;
                         std::vector<strata::core::SessionKvSource> sources;
+                        // incremental: the base goes down to a whole page, the unit the K/V is kept in
+                        const int64_t page = strata::kernels::qsa_real_shapes().page_size;
+                        const int64_t base = save_from
+                            ? (std::min<int64_t>((int64_t) from_tokens, (int64_t) live.size()) / page) * page : 0;
                         // the live running state comes off the device in one synchronous copy
                         blocking("capture", sl.state_bytes == UINT64_MAX ? 0 : sl.state_bytes);
-                        if (!strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
-                                                                         err)) {
+                        const bool sourced = base > 0
+                            ? strata::core::conversation_snapshot_sources_from(meta, sources, view, ss, g, mtp.kv_state(),
+                                                                               base, err)
+                            : strata::core::conversation_snapshot_sources(meta, sources, view, ss, g, mtp.kv_state(),
+                                                                          err);
+                        if (!sourced) {
                             refuse(err, strata::core::SessionError::io);
                             continue;
                         }
+                        saved_base = base;
                         capture_ms = ms();
                         strata::core::SessionWriteOptions wo;
+                        wo.delta_base = (uint64_t) base;
                         wo.min_free_bytes = (uint64_t) o.session_min_free_mib << 20;
                         wo.progress = moving;
                         wo.phase = blocking;
@@ -10034,19 +10059,22 @@ int main(int argc, char** argv) {
                         refuse("not enough RAM to save the session", strata::core::SessionError::memory);
                         continue;
                     }
-                    std::fprintf(stderr, "strata serve: session saved %zu tokens, %zu of %zu checkpoints, %zu bytes to %s "
-                                 "in %.1f ms (state %.1f ms)\n", live.size(), kept, checks.size(), bytes,
-                                 path.c_str(), ms(), capture_ms);
+                    std::fprintf(stderr, "strata serve: session saved %zu tokens%s, %zu of %zu checkpoints, %zu bytes to %s "
+                                 "in %.1f ms (state %.1f ms)\n", live.size(),
+                                 saved_base > 0 ? (" from token " + std::to_string(saved_base)).c_str() : "", kept,
+                                 checks.size(), bytes, path.c_str(), ms(), capture_ms);
                     std::printf("SAVED %zu %zu %.1f\n", live.size(), bytes, ms());
                 } else {
                     strata::core::SavedConversation image;
                     size_t bytes = 0;
+                    int64_t delta_base = 0;   // an incremental file: the tokens this session must already hold
                     try {
                         // bounds this session can ever restore (geometry, layer range, tokens, checkpoints, every
                         // state and K/V part), checked as the file is parsed and before each array is allocated; the
                         // file size follows from them.  The RAM the parse needs at its peak is asked first.
                         strata::core::SessionReadLimits limits;
                         limits.progress = moving;
+                        limits.allow_delta = true;
                         const uint64_t floor = (uint64_t) o.conversation_cache_min_free_mib << 20;
                         limits.admit = [floor, &o](uint64_t need, std::string& why) {
                             const auto mem = strata::core::sample_host_memory();
@@ -10068,14 +10096,33 @@ int main(int argc, char** argv) {
                             refuse(err, st.error);
                             continue;
                         }
+                        delta_base = (int64_t) st.delta_base;
                     } catch (const std::bad_alloc&) {
                         refuse("not enough RAM to read the session", strata::core::SessionError::memory);
                         continue;
                     }
                     const double read_ms = ms();
+                    if (delta_base > 0) {
+                        // the live session must hold exactly the file's first `delta_base` tokens and the images that
+                        // start in them: its K/V there is what the file left out (attention is causal: a cell depends
+                        // on its tokens only, whichever engine computed it)
+                        std::vector<std::pair<int64_t, uint64_t>> a, b;   // (start, hash) of the images before the base
+                        for (const auto& k : live_imgs) if (k.start < delta_base) a.emplace_back(k.start, k.hash);
+                        for (const auto& k : image.live.imgs) if (k.start < delta_base) b.emplace_back(k.start, k.hash);
+                        const bool same_imgs = a == b;
+                        if (!live_ok || cvec_cached != image.cvec || (int64_t) live.size() < delta_base ||
+                            (int64_t) image.live.ids.size() < delta_base || !same_imgs ||
+                            !std::equal(live.begin(), live.begin() + delta_base, image.live.ids.begin())) {
+                            refuse("incremental session file: this engine does not hold its first " +
+                                   std::to_string(delta_base) + " tokens");
+                            continue;
+                        }
+                    }
                     // the whole image against this engine, still without any device write
                     blocking("validate", bytes);
-                    if (!strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
+                    if (delta_base > 0
+                            ? !strata::core::conversation_snapshot_validate_tail(image, delta_base, ss, g, mtp.kv_state(), err)
+                            : !strata::core::conversation_snapshot_validate(image, ss, g, mtp.kv_state(), err)) {
                         refuse(err);
                         continue;
                     }
@@ -10088,7 +10135,9 @@ int main(int argc, char** argv) {
                     live_ok = false;
                     // host -> device in synchronous copies of the whole state: one bounded allowance
                     blocking("transfer", bytes);
-                    if (strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err) !=
+                    if ((delta_base > 0
+                             ? strata::core::conversation_snapshot_restore_tail(image, delta_base, ss, g, mtp.kv_state(), err)
+                             : strata::core::conversation_snapshot_restore(image, ss, g, mtp.kv_state(), err)) !=
                         strata::core::ConversationRestore::restored) {
                         // validated above: a failure here is a transfer failure, after device writes began - never
                         // decode from a partial state; the server starts the engine again
@@ -10112,9 +10161,10 @@ int main(int argc, char** argv) {
                                              "replaces the live one; dropped %zu parked conversation%s\n", n_parked,
                                      n_parked == 1 ? "" : "s");
                     }
-                    std::fprintf(stderr, "strata serve: session restored %zu tokens, %zu checkpoints, %zu bytes from %s "
-                                 "in %.1f ms (read+check %.1f ms)\n", live.size(), checks.size(), bytes, path.c_str(),
-                                 ms(), read_ms);
+                    std::fprintf(stderr, "strata serve: session restored %zu tokens%s, %zu checkpoints, %zu bytes from %s "
+                                 "in %.1f ms (read+check %.1f ms)\n", live.size(),
+                                 delta_base > 0 ? (" (kept the first " + std::to_string(delta_base) + ")").c_str() : "",
+                                 checks.size(), bytes, path.c_str(), ms(), read_ms);
                     std::printf("RESTORED %zu %zu %.1f\n", live.size(), bytes, ms());
                 }
                 std::fflush(stdout);

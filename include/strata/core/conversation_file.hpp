@@ -122,6 +122,9 @@ struct SessionStatus {
     // write: the new file has replaced `path` (the rename happened).  Together with a failure: the file's bytes are
     // complete and flushed, but the folder flush after the rename failed, so the new name may not survive a power loss
     bool published = false;
+    // read: an incremental file's base (the tokens whose K/V the reader must already hold, see SessionWriteOptions);
+    // 0 for a whole session
+    uint64_t delta_base = 0;
     // write (POSIX): this filesystem cannot flush a folder (fsync EINVAL); the save succeeded without that flush
     bool dir_flush_unsupported = false;
 };
@@ -151,6 +154,10 @@ struct SessionWriteOptions {
     SessionPhase phase;
     // tests: return an errno value to make a step fail ("write", "file_flush", "rename", "dir_flush"), 0 to go on
     std::function<int(const char* step)> fault;
+    // incremental file (the PD split hands a session from one engine to another every turn): the K/V sources carry
+    // `from` - only the bytes past the pages before this many tokens are written - and the header records the base.
+    // The running state and checkpoints are written whole.  0: a whole session (format v1 as before)
+    uint64_t delta_base = 0;
 };
 
 // Writes a temporary file beside `path` (a unique hidden name, created exclusively: never an existing file or link;
@@ -171,6 +178,8 @@ struct SessionKvSource {
     int format = 0;
     int64_t cells = 0, heads = 0, head_dim = 0, page_size = 0, pooled_rows = 0, idx_dim = 0;
     std::array<size_t, 5> sizes{};
+    // incremental files: the first byte of each part that is written (the bytes before it are already at the reader)
+    std::array<size_t, 5> from{};
     std::function<bool(size_t part, size_t offset, void* dst, size_t n)> read;
     std::function<std::string()> error;
 };
@@ -222,6 +231,9 @@ struct SessionReadLimits {
     // parse holds at its peak (session_read_peak_bytes); false refuses the file.  Not a reservation.
     std::function<bool(uint64_t need_bytes, std::string& why)> admit;
     SessionProgress progress;
+    // accept an incremental file (its K/V parts hold only their tails); the caller applies it with
+    // conversation_snapshot_restore_tail after checking that it holds the base.  false: such a file is refused
+    bool allow_delta = false;
 };
 // The largest file these limits admit (UINT64_MAX when one of them is open); session_file_read applies it.
 uint64_t session_read_max_file_bytes(const SessionReadLimits& limits);

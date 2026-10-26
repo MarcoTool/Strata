@@ -1866,7 +1866,7 @@ class StrataEngine:
             pass
         return EngineSilent(f"{what}; the server ended the engine")
 
-    def session_file(self, action: str, path: str) -> dict:
+    def session_file(self, action: str, path: str, base: int = 0) -> dict:
         """Disk sessions: `SAVE <path>` / `RESTORE <path>` between requests (the caller holds the service FIFO).
         -> {"tokens", "bytes", "ms"}.  SessionRefused (kind, published) when the engine refused or failed the file and
         is still in step (`SERR <kind> <0|1> <reason>`).  Any line this exchange does not allow - an unknown or
@@ -1880,8 +1880,12 @@ class StrataEngine:
         that never ends is still ended."""
         if action not in ("save", "restore") or any(c in path for c in "\r\n\0"):
             raise ValueError("invalid session command")
+        if not isinstance(base, int) or isinstance(base, bool) or base < 0 or (base and action != "save"):
+            raise ValueError("base: a whole number of tokens (0 or more), for a save only")
+        # base > 0: an incremental file for a reader that already holds the conversation up to `base` tokens
+        command = f"SAVEFROM {base} {path}" if base else f"{'SAVE' if action == 'save' else 'RESTORE'} {path}"
         try:
-            self.proc.stdin.write(f"{'SAVE' if action == 'save' else 'RESTORE'} {path}\n")
+            self.proc.stdin.write(command + "\n")
             self.proc.stdin.flush()
         except OSError:
             raise EngineDied(f"the engine stopped unexpectedly (exit code {self.exit_code()})") from None
@@ -2937,7 +2941,7 @@ class Service:
     def loaded(self) -> bool:
         return not hasattr(self.engine, "alive") or self.engine.alive()
 
-    def slot_action(self, slot: str, action: str, filename) -> tuple[int, dict]:
+    def slot_action(self, slot: str, action: str, filename, base=None) -> tuple[int, dict]:
         """llama-server's POST /slots/{id}?action=save|restore {"filename": ...}: the conversation the engine holds,
         to or from a file in slot_save_path.  -> (HTTP status, body)."""
         def error(code, message):
@@ -2978,7 +2982,10 @@ class Service:
                                        else "restoring a session", started=time.time(), first_token=None,
                                        prompt_tokens=None, generated=None, max_tokens=None)
                 try:
-                    if action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
+                    if base:
+                        # an incremental save (the PD split): {"filename", "base": tokens the reader already holds}
+                        r = self.engine.session_file(action, path, base)
+                    elif action == 'save' and getattr(self.engine, 'session_save_reclaim', False):
                         from serve.session_save_retry import session_file
                         r = session_file(self, action, path, SessionRefused)
                     else:
@@ -5226,7 +5233,7 @@ def make_handler(svc: Service):
                     query = parse_qs(self.path.partition("?")[2])
                     try:
                         code, body = svc.slot_action(path[len("/slots/"):], (query.get("action") or [""])[0],
-                                                     req.get("filename"))
+                                                     req.get("filename"), req.get("base"))
                     except EngineDied as e:                  # EngineSilent included: the engine was ended
                         code, body = 500, {"error": {"code": 500, "message": str(e) + "; the next request starts "
                                                      "the engine again", "type": "server_error"}}

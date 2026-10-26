@@ -296,6 +296,62 @@ bool conversation_snapshot_sources(SavedConversation& meta, std::vector<SessionK
     return true;
 }
 
+bool conversation_snapshot_sources_from(SavedConversation& meta, std::vector<SessionKvSource>& sources,
+                                        const ConversationView& view, const SessionState& ss, const ModelGeometry& g,
+                                        const QsaState& draft, int64_t base, std::string& error) {
+    if (base <= 0 || base > (int64_t) view.ids.size()) return fail(error, "invalid incremental base");
+    if (!view_validate(view, ss, g, error) || !sync(error)) return false;
+    SavedConversation captured;
+    captured.geometry = geometry_key(g);
+    captured.layer_lo = ss.layer_lo; captured.layer_hi = ss.layer_hi;
+    captured.live.ids = view.ids; captured.live.imgs = view.images;
+    captured.cvec = view.cvec; captured.checkpoints = conversation_detail::copy_checkpoints_beating(view.checkpoints);
+    if (!conversation_checkpoint_save(captured.live, ss, g, error)) return false;
+    const int64_t upto = (int64_t) view.ids.size();
+    const size_t layers = owned_qsa(ss);
+    std::vector<SessionKvSource> out(layers + 1);
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_source_from(out[j], owned(ss, j), g, upto, true, base, error)) return false;
+    // the draft's final cell may not have been computed when the output cap was reached: one token earlier
+    if (!conversation_kv_source_from(out.back(), draft, g, upto, false, std::max<int64_t>(0, base - 1), error))
+        return false;
+    meta = std::move(captured);
+    sources = std::move(out);
+    return true;
+}
+
+bool conversation_snapshot_validate_tail(const SavedConversation& image, int64_t base, const SessionState& ss,
+                                         const ModelGeometry& g, const QsaState& draft, std::string& error) {
+    if (!image.stage_images.empty() || !image.live.stage_parts.empty())
+        return fail(error, "an incremental file of a layer split");
+    if (image.geometry != geometry_key(g)) return fail(error, "incompatible runtime geometry");
+    if (image.layer_lo != ss.layer_lo || image.layer_hi != ss.layer_hi)
+        return fail(error, "snapshot from another session layer range");
+    const ConversationView view{image.live.ids, image.live.imgs, image.checkpoints, image.cvec};
+    if (!view_validate(view, ss, g, error) || !conversation_checkpoint_validate(image.live, ss, g, error)) return false;
+    const int64_t upto = (int64_t) image.live.ids.size();
+    if (base <= 0 || base > upto) return fail(error, "invalid incremental base");
+    const size_t layers = owned_qsa(ss);
+    if (image.kv.size() != layers + 1) return fail(error, "invalid K/V layer count");
+    for (size_t j = 0; j < layers; ++j)
+        if (!conversation_kv_validate_tail(image.kv[j], owned(ss, j), g, upto, true, base, error)) return false;
+    return conversation_kv_validate_tail(image.kv.back(), draft, g, upto, false, std::max<int64_t>(0, base - 1), error);
+}
+
+ConversationRestore conversation_snapshot_restore_tail(const SavedConversation& image, int64_t base, SessionState& ss,
+                                                        const ModelGeometry& g, const QsaState& draft,
+                                                        std::string& error) {
+    if (!conversation_snapshot_validate_tail(image, base, ss, g, draft, error)) return ConversationRestore::invalid;
+    if (!sync(error)) return ConversationRestore::transfer_failed;
+    const int64_t upto = (int64_t) image.live.ids.size();
+    for (size_t j = 0; j < owned_qsa(ss); ++j)
+        if (!conversation_kv_restore_tail(image.kv[j], owned(ss, j), g, upto, true, base, error))
+            return ConversationRestore::transfer_failed;
+    if (!conversation_kv_restore_tail(image.kv.back(), draft, g, upto, false, std::max<int64_t>(0, base - 1), error) ||
+        !conversation_checkpoint_restore(image.live, ss, g, error)) return ConversationRestore::transfer_failed;
+    return ConversationRestore::restored;
+}
+
 bool conversation_session_read_limits(SessionReadLimits& limits, const SessionState& ss, const ModelGeometry& g,
                                       const QsaState& draft, uint64_t max_tokens, uint64_t max_checkpoints,
                                       std::string& error) {

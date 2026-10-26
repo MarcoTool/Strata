@@ -226,6 +226,78 @@ bool conversation_kv_restore(const ConversationKv& image, const QsaState& st, co
     return false;
 }
 
+bool conversation_kv_keep(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index, int64_t base,
+                          std::array<size_t, 5>& keep, std::string& error) {
+    Layout l{};
+    if (!layout(st, g, upto, index, l, error)) return false;
+    if (base < 0 || base > upto) { error = "conversation snapshot: invalid incremental base"; return false; }
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const int64_t whole_cells = (base / l.page_size) * l.page_size;
+    for (size_t i = 0; i < sizes.size(); ++i)
+        keep[i] = i == 4 ? (index ? size_t(base / strata::kernels::qsa_real_shapes().idx_block) * g.idx_key_dim * 4 : 0)
+                         : l.cells ? (sizes[i] / size_t(l.cells)) * size_t(whole_cells) : 0;
+    for (size_t i = 0; i < sizes.size(); ++i)
+        if (keep[i] > sizes[i]) { error = "conversation snapshot: incremental base past the K/V"; return false; }
+    return true;
+}
+
+bool conversation_kv_source_from(SessionKvSource& out, const QsaState& st, const ModelGeometry& g, int64_t upto,
+                                 bool index, int64_t base, std::string& error) {
+    std::array<size_t, 5> keep{};
+    if (!conversation_kv_keep(st, g, upto, index, base, keep, error)) return false;
+    if (!conversation_kv_source(out, st, g, upto, index, error)) return false;
+    out.from = keep;
+    return true;
+}
+
+bool conversation_kv_validate_tail(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                                   int64_t upto, bool index, int64_t base, std::string& error) {
+    Layout l{};
+    std::array<size_t, 5> keep{};
+    if (!layout(st, g, upto, index, l, error) || !valid(st, l, upto, error) ||
+        !conversation_kv_keep(st, g, upto, index, base, keep, error)) return false;
+    if (image.format != l.format || image.cells != l.cells || image.heads != g.n_head_kv ||
+        image.head_dim != g.head_dim || image.page_size != l.page_size || image.pooled_rows != l.pooled_rows ||
+        image.idx_dim != g.idx_key_dim) {
+        error = "conversation snapshot: incompatible K/V geometry";
+        return false;
+    }
+    const std::array<size_t, 5> sizes = {l.data, l.value_data, l.scales, l.value_scales, l.pooled};
+    const std::array<const ConversationBuffer*, 5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    const auto dst = pools(st);
+    for (size_t i = 0; i < src.size(); ++i) {
+        if (src[i]->size() != sizes[i] - keep[i]) { error = "conversation snapshot: invalid incremental K/V size"; return false; }
+        if (sizes[i] && !dst[i]) { error = "conversation snapshot: missing target state buffer"; return false; }
+    }
+    return true;
+}
+
+bool conversation_kv_restore_tail(const ConversationKv& image, const QsaState& st, const ModelGeometry& g,
+                                  int64_t upto, bool index, int64_t base, std::string& error) {
+    std::array<size_t, 5> keep{};
+    if (!conversation_kv_validate_tail(image, st, g, upto, index, base, error) ||
+        !conversation_kv_keep(st, g, upto, index, base, keep, error)) return false;
+    const std::array<const ConversationBuffer*, 5> src = {&image.k, &image.v, &image.k_scale, &image.v_scale, &image.pooled};
+    const auto dst = pools(st);
+    for (size_t i = 0; i < src.size(); ++i)
+        if (!src[i]->visit(0, src[i]->size(), [&](const uint8_t* p, size_t n, size_t at) {
+                return transfer(static_cast<uint8_t*>(dst[i]) + keep[i] + at, p, n, error);
+            })) return false;
+    // the same residency refresh as a whole restore: the streamed slots and the draft ring reload from the pools
+    if (st.kv_mode == 1) strata::kernels::kv_stream_reset(st.map, nullptr);
+    if (st.kv_mode == 2 && upto > 0) {
+        auto shapes = strata::kernels::qsa_real_shapes();
+        shapes.n_head_kv = g.n_head_kv; shapes.head_dim = g.head_dim;
+        const int64_t end = (upto + shapes.page_size - 1) / shapes.page_size;
+        strata::kernels::kv_ring_restore(qsa_attn_pools(st), st.host, qsa_kv_format(st),
+                                        std::max<int64_t>(0, end - st.n_slots), end, st.n_slots, shapes, nullptr);
+    }
+    const auto status = cudaGetLastError();
+    if (status == cudaSuccess) return true;
+    error = std::string("conversation snapshot residency restore: ") + cudaGetErrorString(status);
+    return false;
+}
+
 bool conversation_kv_part_sizes(const QsaState& st, const ModelGeometry& g, int64_t upto, bool index,
                                 std::array<uint64_t, 5>& sizes, std::string& error) {
     Layout l{};
