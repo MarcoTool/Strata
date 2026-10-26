@@ -1046,6 +1046,10 @@ class StrataEngine:
             pn = prefix.get("tokens")
             if isinstance(pn, int) and not isinstance(pn, bool) and pn > 0:
                 keys += f" pin={pn}"
+        # "strata_lane": "scratch" - the engine's side session (--scratch-context): a short side call that must not
+        # replace the main conversation's cells.  Absent = the main session.
+        if sampling.get("strata_lane") == "scratch":
+            keys += " lane=scratch"
         return keys + StrataEngine.projection_key(sampling) + bias_api.engine_key(sampling.get("logit_bias"))
 
     @staticmethod

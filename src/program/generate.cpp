@@ -126,6 +126,7 @@
 #include <string>
 #include <set>
 #include <vector>
+#include "strata/program/scratch_lane.hpp"
 
 namespace {
 // Windows' WDDM driver model: native Windows, or WSL2 (its GPU goes through /dev/dxg to the Windows driver).  There,
@@ -552,6 +553,11 @@ struct Options {
     /// sent as `BGEN <slot> <max_new> ...` reads its prompt and its first token through the usual path, then
     /// continues in slot <slot> of the batch windows (`BT <slot> <id>` lines, then `BDONE <slot> ...`).
     int batch = 0;
+    /// --serve: a second, small session of this many cells beside the main one, for requests sent with `lane=scratch`
+    /// (short side calls - a title, a tool's answer - that would otherwise replace the main conversation's cells).
+    /// It has its own prompt path, verifier, draft K/V and checkpoints; the weights, the expert cache and the pool are
+    /// shared (include/strata/program/scratch_lane.hpp).  0 = off: nothing is allocated, every request is the main one's.
+    int64_t scratch_context = 0;
     /// With an explicit --layer-split, every GPU loads only its own layers' dense weights instead of the whole
     /// model's: the VRAM they took goes back to the expert cache (opt-in)
     bool trim_stage_weights = false;
@@ -2019,6 +2025,7 @@ int main(int argc, char** argv) {
         else if (a == "--spec") o.spec = std::atoi(next("--spec"));
         else if (a == "--batch") o.batch = std::atoi(next("--batch"));
         else if (a == "--slots") o.batch = std::atoi(next("--slots"));   // the same as --batch
+        else if (a == "--scratch-context") o.scratch_context = std::atoll(next("--scratch-context"));
         else if (a == "--trim-stage-weights") o.trim_stage_weights = true;
         else if (a == "--batch-groups") {
             const char* bgv = next("--batch-groups");
@@ -4316,6 +4323,39 @@ int main(int argc, char** argv) {
         }
     }
     mem_mark("the session (KV, GDN state, PLE history)");
+    // --scratch-context: the side session (see the option), on CUDA0 beside the main one and before the expert cache
+    // takes what is free.  Its PLE run is the main session's (weights, table, scratch) but for its own history and tokens.
+    strata::core::SessionState scratch_ss;
+    if (o.scratch_context > 0) {
+        const char* why = strata::program::scratch_lane::refusal(o.serve, multi_gpu || !stages.empty(), o.batch,
+                                                                 strata::core::qsa_kv_elastic(), o.peer_device,
+                                                                 o.pipeline_windows, o.scratch_context, o.max_context);
+        if (why != nullptr) {
+            std::fprintf(stderr, "strata generate: --scratch-context is off: %s\n", why);
+            o.scratch_context = 0;
+        } else {
+            const strata::core::OnDevice on0(0);
+            void* buf = nullptr;
+            if (cudaMalloc(&buf, strata::core::session_bytes(g, o.scratch_context, K, 0, -1)) != cudaSuccess ||
+                strata::core::session_init(g, o.scratch_context, K, buf, scratch_ss, 0, -1) == 0) {
+                std::fprintf(stderr, "strata generate: --scratch-context: the side session failed%s\n",
+                             vram_free_note().c_str());
+                return 1;
+            }
+            scratch_ss.ple = ss.ple;
+            scratch_ss.ple.token = &scratch_ss.ple_token;
+            scratch_ss.ple.prev = scratch_ss.ple_prev;
+            scratch_ss.ple.hist = scratch_ss.ple_hist;
+            strata::core::session_zero(scratch_ss, g, nullptr, main_cs);
+            if (cudaDeviceSynchronize() != cudaSuccess) {
+                std::fprintf(stderr, "strata generate: --scratch-context: zeroing the side session failed\n");
+                return 1;
+            }
+            std::fprintf(stderr, "strata generate: --scratch-context %lld: a side session of %.2f GiB on CUDA0 for "
+                                 "lane=scratch requests\n", (long long) o.scratch_context,
+                         (double) strata::core::session_bytes(g, o.scratch_context, K, 0, -1) / 1073741824.0);
+        }
+    }
     for (size_t i = 0; i < stages.size(); ++i) {
         GpuStage& st = *stages[i];
         const strata::core::OnDevice on(st.dev);
@@ -4530,6 +4570,18 @@ int main(int argc, char** argv) {
                              (double) fb / 1073741824.0);
             }
         }
+    }
+    strata::core::MtpDrafter scratch_mtp;   // --scratch-context: the side session's draft K/V, sharing mtp's weights
+    if (o.scratch_context > 0 && !o.mtp.empty()) {
+        scratch_mtp.set_hnorm_per_stream(o.mtp_hnorm_stream);
+        scratch_mtp.set_q4(o.mtp_q4 == "all" || o.mtp_q4 == "proj", o.mtp_q4 == "all" || o.mtp_q4 == "head");
+        if (!o.mtp_draft_vocab.empty()) scratch_mtp.set_draft_vocab(o.mtp_draft_vocab);
+        if (!scratch_mtp.load(o.mtp, draft_geometry, scratch_ss, o.spec, err, o.mtp_window, &mtp)) {
+            std::fprintf(stderr, "strata generate: --scratch-context: the side drafter: %s%s\n", err.c_str(),
+                         vram_free_note().c_str());
+            return 1;
+        }
+        scratch_mtp.set_ple_session(&scratch_ss);
     }
     // THE HEAD BEFORE THE CACHE, AND BEFORE THE ARENA.  The expert cache takes what is free minus the reserve, so
     // everything allocated after it comes out of the reserve.  The native head (~0.5 GB with IQ3_S) was loaded after
@@ -7616,6 +7668,28 @@ int main(int argc, char** argv) {
             return 1;
         }
         if (pipe) mtp.set_source_R(ver.final_R_all());   // the serial decode's rows (the last stage's even verifier)
+        // --scratch-context: the side session's prompt path and verifier (its graphs over its own state), the side
+        // drafter bound to that verifier's rows, and its own lend bookkeeping.  The loan is the same cache slots as
+        // the main prompt path's: requests run one at a time, and each path lays its buffers out when it borrows them.
+        strata::prefill::Prefill scratch_sp;
+        strata::core::Verifier scratch_ver;
+        std::vector<PfPart> scratch_pf_parts;
+        if (o.scratch_context > 0) {
+            if (share_pool) scratch_sp.set_cpu_pool(&pool);
+            scratch_ver.set_remote_expert_opt(remote_opt.get());
+            if (!scratch_sp.init(wt, g, scratch_ss, prefill_src, &xcache, host_res.data(), o.prefill_chunk, main_cs, err,
+                                 borrow, borrow_bytes) ||
+                !scratch_ver.init(wt, g, scratch_ss, vh, native_head.loaded() ? &native_head : nullptr, o.spec, err) ||
+                (use_mtp && !scratch_mtp.bind(wt, &native_head, scratch_ver.final_R_all(), err, &mtp))) {
+                std::fprintf(stderr, "strata serve: --scratch-context: %s%s (raise --vram-reserve-mib)\n", err.c_str(),
+                             vram_free_note().c_str());
+                return 1;
+            }
+            scratch_ver.set_split(o.spec_split);
+            scratch_ver.set_pcie_mode(o.pcie_mode == "dma" ? 0 : o.pcie_mode == "direct" ? 1 : 2);
+            scratch_pf_parts = pf_parts;
+            for (PfPart& p : scratch_pf_parts) { p.ses = &scratch_ss; p.sp = &scratch_sp; }
+        }
         auto free_slot_mtp_rows = [](float* p) { if (p != nullptr) (void) cudaFree(p); };
         std::vector<std::unique_ptr<float, decltype(free_slot_mtp_rows)>> slot_mtp_rows;
         if (batch_mtp) {
@@ -7801,6 +7875,14 @@ int main(int argc, char** argv) {
         uint64_t check_clock = 0;   // the checkpoints' LRU clock; creation and every use advance it
         int64_t tail_ckpt_len = -1;   // --prompt-cache-tail: the length of the one tail checkpoint alive (-1 = none)
         bool cvec_cached = true;   // the control vector's state the live session and the checkpoints were read with
+        // --scratch-context: the side session's own bookkeeping (each one means what the main session's above means)
+        std::vector<int32_t> scratch_live;
+        std::vector<ImgKey> scratch_live_imgs;
+        bool scratch_live_ok = false;
+        std::vector<ConvCheckpoint> scratch_checks;
+        uint64_t scratch_check_clock = 0;
+        int64_t scratch_tail_ckpt_len = -1;
+        bool scratch_cvec_cached = true;
         // without --mtp the conversation cache stays on: a parked image carries the draft layer's K/V only when there is one
         // (the snapshots accept a null draft)
         strata::core::ConversationCache conversations(
@@ -8103,7 +8185,11 @@ int main(int argc, char** argv) {
                        ") - a GPU hang; on Windows the driver is then reset";
             return false;
         };
-        auto checkpoint_at = [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
+        // the lane's session and checkpoint chain are parameters (--scratch-context makes a second lane); the main
+        // session's checkpoint_at is made from it below
+        auto make_checkpoint_at = [&](strata::core::SessionState& ss, std::vector<ConvCheckpoint>& checks,
+                                      uint64_t& check_clock, int64_t& tail_ckpt_len) {
+        return [&](int64_t L, std::vector<ConvCheckpoint>* parts = nullptr, bool as_tail = false) -> bool {
             ckpt_why.clear();
             if (o.prompt_cache <= 0 || L < 1) return true;
             for (ConvCheckpoint& c : checks)
@@ -8169,11 +8255,16 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        };
+        auto checkpoint_at = make_checkpoint_at(ss, checks, check_clock, tail_ckpt_len);
+        auto scratch_checkpoint_at = make_checkpoint_at(scratch_ss, scratch_checks, scratch_check_clock,
+                                                        scratch_tail_ckpt_len);
         // STRATA_SPLIT_MTP_BATCH=1 (default off): the layer split's drafter is on the last stage, so E-9 (Prefill::draft_kv)
         // runs there, on the Prefill that ran the chunk, instead of the drafter's own per-8-row pass.  The drafts' K/V
         // come from Q8_1 x Q8_0 MMQ rather than mmvq: drafts may differ, the target's tokens never.
         static const bool split_mtp_batch = strata::program::draft_kv::split_env_on(std::getenv("STRATA_SPLIT_MTP_BATCH"));
-        sp.on_chunk = [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
+        auto make_on_chunk = [&](strata::prefill::Prefill& sp, strata::core::MtpDrafter& mtp, auto& checkpoint_at) {
+        return [&](const float* R_rows, int64_t T, int64_t p0, std::string& e) -> bool {
             std::vector<int32_t> nxt((size_t) T);
             for (int64_t t = 0; t < T; ++t) nxt[(size_t) t] = (int32_t) cur[(size_t) (p0 + t + 1)];
             // E-9: batched through the prompt path when it can (a layer split: only with STRATA_SPLIT_MTP_BATCH=1)
@@ -8238,6 +8329,9 @@ int main(int argc, char** argv) {
             }
             return true;
         };
+        };
+        sp.on_chunk = make_on_chunk(sp, mtp, checkpoint_at);
+        if (o.scratch_context > 0) scratch_sp.on_chunk = make_on_chunk(scratch_sp, scratch_mtp, scratch_checkpoint_at);
         if (multi_gpu) {   // the batched prompt is reported by its last stage (the drafter's rows are there)
             stages.back()->sp.on_chunk = std::move(sp.on_chunk);
             sp.on_chunk = nullptr;
@@ -8258,6 +8352,27 @@ int main(int argc, char** argv) {
                 };
             }
         }
+        // --scratch-context: what a request's lane is made of; the request path binds one at its start
+        struct ServeLane {
+            strata::core::SessionState* ss;
+            strata::prefill::Prefill* sp;
+            strata::core::Verifier* ver;
+            strata::core::MtpDrafter* mtp;
+            std::vector<int32_t>* live;
+            std::vector<ImgKey>* live_imgs;
+            bool* live_ok;
+            std::vector<ConvCheckpoint>* checks;
+            uint64_t* check_clock;
+            int64_t* tail_ckpt_len;
+            bool* cvec_cached;
+            std::vector<PfPart>* pf_parts;
+            decltype(checkpoint_at)* checkpoint_at;
+        };
+        ServeLane main_lane{&ss, &sp, &ver, &mtp, &live, &live_imgs, &live_ok, &checks, &check_clock, &tail_ckpt_len,
+                            &cvec_cached, &pf_parts, &checkpoint_at};
+        ServeLane side_lane{&scratch_ss, &scratch_sp, &scratch_ver, &scratch_mtp, &scratch_live, &scratch_live_imgs,
+                            &scratch_live_ok, &scratch_checks, &scratch_check_clock, &scratch_tail_ckpt_len,
+                            &scratch_cvec_cached, &scratch_pf_parts, &scratch_checkpoint_at};
         drive.d.plan = ver.plan_sink();
         // Foresight swap space (STRATA_FS_SLOTS; unset = null and nothing changes)
         std::unique_ptr<strata::core::ForesightSwap> fs_swap;
@@ -8378,6 +8493,8 @@ int main(int argc, char** argv) {
                 for (int64_t l = 0; l <= g.n_layers; ++l) agate.ticks[(size_t) l] = {&agate, (int32_t) l};
                 agate.has.assign((size_t) g.n_layers, 0);
                 if (!ver.set_adapt_gate(&agate)) aov_why = "the device-planned layers (STRATA_VERIFY_DEVICE_PLAN) are on";
+                if (aov_why == nullptr && o.scratch_context > 0 && !scratch_ver.set_adapt_gate(&agate))
+                    aov_why = "the side session's verifier (--scratch-context) takes no gate";
                 if (aov_why == nullptr && !(std::getenv("STRATA_ADAPT_SIGNAL") && std::getenv("STRATA_ADAPT_SIGNAL")[0] == 'h')) {
                     // the landing of each layer's copies is told by a stream-ordered D2H copy of the layer number into pinned memory
                     // (STRATA_ADAPT_SIGNAL=host: a host function instead). No callback thread has to be scheduled while the pool's workers spin on every other CPU
@@ -9011,6 +9128,7 @@ int main(int argc, char** argv) {
             return true;
         };
         sp.should_stop = [&] { return stop_req.load(); };
+        if (o.scratch_context > 0) scratch_sp.should_stop = sp.should_stop;
         // STRATA_TRACE=1: one stderr line per step of a request (the log shows where a request stops)
         const bool trace = std::getenv("STRATA_TRACE") != nullptr;
         auto tr = [&](const char* what, long long a = -1, long long b = -1) {
@@ -9165,6 +9283,7 @@ int main(int argc, char** argv) {
         if (use_mtp && S_mtp < S) mtp.set_max_drafts(S_mtp - 1);
         // --pipeline-windows 2 loads the drafter with 8 rows: the serial loop's chain keeps its own length
         else if (use_mtp && mtp.max_t() > S_mtp) mtp.set_max_drafts(S_mtp - 1);
+        if (use_mtp && o.scratch_context > 0 && S_mtp < S) scratch_mtp.set_max_drafts(S_mtp - 1);
         strata::spec::SuffixDrafter sfx(std::max(1, o.suffix_draft), 64, (size_t) o.max_context + 4096);
         strata::spec::DraftPolicy policy(S);   // MTP or lookup window, learned over the whole process
         // The vision path (--vision): GENI <max_new> <embeddings file> <id,id,...> carries images.  The file is one
@@ -10198,6 +10317,7 @@ int main(int argc, char** argv) {
             // a parked conversation holding it stays parked) and a later request that resumes from it does not park the
             // branch it leaves: N queries cost one prefix, not N.  Absent = as before.
             int64_t req_pin = 0;
+            bool req_scratch = false;   // lane=scratch: this request runs on the side session (--scratch-context)
             // tuning keys (setup's calibration measures settings without restarting the engine): the PCIe share of
             // the missed experts and the draft-probability floor, for this request only
             double req_pcie_frac = o.pcie_frac, req_spec_min_p = o.spec_min_p;
@@ -10218,6 +10338,7 @@ int main(int argc, char** argv) {
                     else if (key == "cvec") req_cvec = std::atoi(tok.c_str() + eq + 1);
                     else if (key == "ckpt") req_ckpt = std::atoi(tok.c_str() + eq + 1) != 0;
                     else if (key == "pin") req_pin = std::max<long long>(0, std::atoll(tok.c_str() + eq + 1));
+                    else if (key == "lane") req_scratch = tok.substr(eq + 1) == "scratch";
                     else if (key == "temperature") req_temperature = fv;
                     else if (key == "top_p") req_top_p = fv;
                     else if (key == "top_k") req_top_k = std::atoi(tok.c_str() + eq + 1);
@@ -10233,6 +10354,30 @@ int main(int argc, char** argv) {
                     // unknown keys are skipped: the ids start at the first token without '='
                 }
             }
+            // --scratch-context: from here to the end of the request these names are the request's lane's - the side
+            // session's for lane=scratch, otherwise the main session's (the same objects as before: nothing changes)
+            if (req_scratch && o.scratch_context <= 0) {
+                std::printf("ERR lane=scratch needs an engine started with --scratch-context\n");
+                continue;
+            }
+            const bool scratch_lane = req_scratch;
+            ServeLane& lane = scratch_lane ? side_lane : main_lane;
+            ServeLane& other_lane = scratch_lane ? main_lane : side_lane;
+            strata::core::SessionState& ss = *lane.ss;
+            strata::prefill::Prefill& sp = *lane.sp;
+            strata::core::Verifier& ver = *lane.ver;
+            strata::core::MtpDrafter& mtp = *lane.mtp;
+            std::vector<int32_t>& live = *lane.live;
+            std::vector<ImgKey>& live_imgs = *lane.live_imgs;
+            bool& live_ok = *lane.live_ok;
+            std::vector<ConvCheckpoint>& checks = *lane.checks;
+            uint64_t& check_clock = *lane.check_clock;
+            int64_t& tail_ckpt_len = *lane.tail_ckpt_len;
+            bool& cvec_cached = *lane.cvec_cached;
+            std::vector<PfPart>& pf_parts = *lane.pf_parts;
+            auto& checkpoint_at = *lane.checkpoint_at;
+            const int64_t lane_context = scratch_lane ? o.scratch_context : o.max_context;
+            drive.d.plan = ver.plan_sink();   // the CPU pool's expert plan goes to this lane's verifier
             std::vector<float> req_bias;
             std::string bias_error;
             if (req_bias_present && (o.batch > 0 ||
@@ -10345,9 +10490,9 @@ int main(int argc, char** argv) {
                 mrope_identity = !geni;
             }
             sp.embd_rows = geni ? row_ptr.data() : nullptr;
-            if (n + max_new + 8 > o.max_context) {
+            if (n + max_new + 8 > lane_context) {
                 std::printf("ERR prompt (%lld tokens) + max_new (%lld) exceeds the context (%lld)\n", (long long) n,
-                            (long long) max_new, (long long) o.max_context);
+                            (long long) max_new, (long long) lane_context);
                 continue;
             }
             bool bad = false;
@@ -10406,6 +10551,11 @@ int main(int argc, char** argv) {
                 live_ok = false;
                 checks.clear();
                 tail_ckpt_len = -1;
+                if (o.scratch_context > 0) {   // the other lane ran on the same engine state: it goes too
+                    *other_lane.live_ok = false;
+                    other_lane.checks->clear();
+                    *other_lane.tail_ckpt_len = -1;
+                }
                 const size_t n_parked = conversations.clear();
                 size_t n_slots = 0, n_running = 0;
                 for (BSlot& sl : bs)
@@ -10458,7 +10608,7 @@ int main(int argc, char** argv) {
                 }
             const auto parked = conversations.best(ids, req_imgs, want_cvec);
             std::optional<strata::core::SavedConversation> incoming;
-            if (parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
+            if (!scratch_lane && parked.tokens > std::max(resume, slot_tokens)) incoming.emplace(conversations.take(parked.index));
             if (incoming) slot_source = -1;
             // Reject the entire image before parking/overwriting the outgoing
             // state. Invalid entries can safely fall back to its existing prefix.
@@ -10494,7 +10644,8 @@ int main(int argc, char** argv) {
                 resume == req_pin && live_ok)
                 for (const ConvCheckpoint& c : checks)
                     if ((int64_t) c.ids.size() == resume && c.pinned) pin_sibling = true;
-            if ((!from_live || incoming || slot_source >= 0) && !pin_sibling && !park_current(incoming ? incoming->bytes() : 0)) {
+            if (!scratch_lane && (!from_live || incoming || slot_source >= 0) && !pin_sibling &&
+                !park_current(incoming ? incoming->bytes() : 0)) {
                 std::printf("ERR %s\n", err.c_str());
                 return 1;
             }
@@ -10672,7 +10823,7 @@ int main(int argc, char** argv) {
             tr("request", n, geni ? 1 : 0);
             if (use_mtp) mtp.set_prompt_len(n);
             const int64_t read_from = reread_to > 0 ? 0 : resume;
-            conversations.limit_reuse(read_from);
+            if (!scratch_lane) conversations.limit_reuse(read_from);
             pp_total = n;
             pp_from = read_from;
             pp_reached = read_from;
@@ -12045,7 +12196,7 @@ int main(int argc, char** argv) {
                 T += chain_n;
                 const bool timed_round = !first_window;
                 const Clock::time_point round0 = Clock::now();
-                if (p + T > o.max_context) break;
+                if (p + T > lane_context) break;
                 window[0] = x;
                 for (int i = 1; i < T_mtp; ++i) window[(size_t) i] = from_sfx ? sbuf[(size_t) i - 1] : drafts[(size_t) i - 1];
                 for (int i = 0; i < chain_n; ++i) window[(size_t) (T_mtp + i)] = cbuf[(size_t) i];
