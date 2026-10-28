@@ -535,7 +535,7 @@ bool ExpertCache::grow(int64_t want_bytes, std::string& err) {
 #endif
 }
 
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
 bool ExpertCache::ensure_blocking_staging(std::size_t bytes, std::string& err) {
     if (bytes <= blocking_staging_bytes_) return true;
     void* next = nullptr;
@@ -629,7 +629,7 @@ bool ExpertCache::open(int64_t n_slots, int64_t n_layers, int64_t n_expert, int6
     n_layers_ = n_layers;
     n_expert_ = n_expert;
     blob_ = blob_bytes;
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
         close();
         return false;
@@ -667,7 +667,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
     blob_ = mx;
     off_ = std::move(off);
     guard_ = guard_req_;
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     if (!ensure_blocking_staging((std::size_t) blob_, err)) {
         close();
         return false;
@@ -685,7 +685,7 @@ bool ExpertCache::open_sized(const std::vector<int64_t>& slot_bytes, int64_t n_l
 }
 
 void ExpertCache::close() {
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     if (blocking_staging_) (void) cudaFreeHost(blocking_staging_);
     blocking_staging_ = nullptr;
     blocking_staging_bytes_ = 0;
@@ -798,7 +798,7 @@ bool ExpertCache::fill_slot_blocking(int32_t slot, const uint8_t* host_blob, std
         err = "ExpertCache::fill_slot_blocking: the host blob is null";
         return false;
     }
-#if defined(STRATA_USE_HIP)
+#if defined(STRATA_USE_HIP) || defined(STRATA_HIP_GFX906)
     // Bound HIP's pageable-source staging to one expert instead of repeatedly
     // registering regions of the mmap. The blocking copy completes before reuse.
     if (!blocking_staging_ || n > blocking_staging_bytes_) {
