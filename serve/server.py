@@ -8508,7 +8508,10 @@ def start_split(cfg: dict, spec: dict, exe: str, effort_end: list[str], lazy: bo
                 rc["args"] = list(rc["args"]) + ["--shared-expert-arena", arena]
             if role == "prefill":
                 warn_budget_over_ram(engine_args(rc) if "args" in rc else [])
-            engines[role] = StrataEngine(exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
+            role_exe = exe
+            if rc.get("exe") != cfg.get("exe"):           # this role names an engine build of its own
+                role_exe = rc["exe"] if os.path.isabs(rc["exe"]) else os.path.abspath(os.path.join(rc.get("cwd") or ".", rc["exe"]))
+            engines[role] = StrataEngine(role_exe, engine_args(rc) + effort_end, cwd=rc.get("cwd"), log=rc.get("log"),
                                          env=child_env(rc, offline=offline), lazy=lazy)
     except BaseException:
         for e in engines.values():

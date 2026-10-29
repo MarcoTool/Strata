@@ -16,6 +16,9 @@ Opt-in, in the run config (nothing changes without it):
     shared_arena               true (default): one copy of the experts in RAM for both engines (Linux, a file in /dev/shm
                                when the experts fit there); false: each engine keeps its own copy; a path: that file
     prefill_args / decode_args extra engine arguments for one role (a bigger expert cache for the decode engine, say)
+    prefill_engine / decode_engine  {"exe", "backend", "lib_dirs", "env"} for one role: an engine build, a backend and
+                               an environment of its own (an NVIDIA card reading the prompt, an AMD card making the
+                               answer).  The two cards may then have the same number: each backend numbers its own.
 
 What must match between the two engines is what the session file checks (docs/SPLIT_SERVE.md): the model files, the engine
 version, the backend, --kv, --max-context, --kv-resident, --mtp-window, the rope settings and the arithmetic switches.  They
@@ -35,7 +38,9 @@ import threading
 import time
 
 MIN_TOKENS = 2048                    # the decode engine's own tail below this is read in place
-KNOWN_KEYS = {"prefill_gpu", "decode_gpu", "min_prompt_tokens", "dir", "shared_arena", "prefill_args", "decode_args"}
+KNOWN_KEYS = {"prefill_gpu", "decode_gpu", "min_prompt_tokens", "dir", "shared_arena", "prefill_args", "decode_args",
+              "prefill_engine", "decode_engine"}
+ENGINE_KEYS = {"exe", "backend", "lib_dirs", "env"}   # what prefill_engine / decode_engine may set for one role
 FORBIDDEN_ARGS = {                   # engine arguments that cannot be used in a split-serve engine, and why
     "--layer-split": "an engine of the split runs on one card",
     "--split-device": "an engine of the split runs on one card",
@@ -69,10 +74,22 @@ def split_spec(cfg: dict) -> dict | None:
         if isinstance(v, bool) or not isinstance(v, int) or v < 0:
             raise SplitConfigError(f'"split_serve" needs "{k}": the number of a card (0, 1, ...), not {v!r}')
         cards.append(v)
-    if cards[0] == cards[1]:
+    roles = {}
+    for k in ("prefill_engine", "decode_engine"):
+        e = raw.get(k, {})
+        if not isinstance(e, dict) or set(e) - ENGINE_KEYS:
+            raise SplitConfigError(f'"split_serve": "{k}" must be an object with keys from {", ".join(sorted(ENGINE_KEYS))}')
+        if "env" in e and not isinstance(e["env"], dict):
+            raise SplitConfigError(f'"split_serve": "{k}"."env" must be an object of environment variables')
+        if "lib_dirs" in e and not isinstance(e["lib_dirs"], list):
+            raise SplitConfigError(f'"split_serve": "{k}"."lib_dirs" must be a list of folders')
+        roles[k] = dict(e)
+    backends = [roles[k].get("backend", cfg.get("backend")) for k in ("prefill_engine", "decode_engine")]
+    if cards[0] == cards[1] and backends[0] == backends[1]:
         raise SplitConfigError(f'"split_serve": prefill_gpu and decode_gpu are both card {cards[0]}; each engine needs a '
                                "card of its own")
     out = {"prefill_gpu": cards[0], "decode_gpu": cards[1]}
+    out.update(roles)
     n = raw.get("min_prompt_tokens", MIN_TOKENS)
     if isinstance(n, bool) or not isinstance(n, int) or n < 0:
         raise SplitConfigError(f'"split_serve": "min_prompt_tokens" must be a number of tokens (0 or more), not {n!r}')
@@ -127,6 +144,12 @@ def role_cfg(cfg: dict, spec: dict, role: str) -> dict:
     c["log"] = _suffixed(cfg.get("log"), role)
     if cfg.get("expert_profile_save"):
         c["expert_profile_save"] = _suffixed(cfg["expert_profile_save"], role)
+    eng = spec.get(f"{role}_engine") or {}
+    for k in ("exe", "backend", "lib_dirs"):
+        if k in eng:
+            c[k] = eng[k]
+    if "env" in eng:
+        c["env"] = {**(c.get("env") or {}), **eng["env"]}
     extra = spec[f"{role}_args"]
     if extra:
         c["args"] = list(c["args"]) + extra
