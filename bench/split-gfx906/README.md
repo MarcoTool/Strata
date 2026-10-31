@@ -105,14 +105,22 @@ The MI50-only configs need only the ROCm image, and `rtx3070-one` only the CUDA 
 
 ## 5. Measure
 
+The speed issues use Strata's standard benchmark, then the same benchmark prompts at 32K to 258K:
+
 ```sh
-PORT=8080 python3 bench/split-gfx906/depth_one.py 16384 32768 65536 131072 196608 258048 > result.tsv
+python3 strata.py bench run --url http://127.0.0.1:8080 --suite standard-v1 --track custom --out result/standard
+PYTHONPATH=. python3 bench/split-gfx906/long_standard.py --url http://127.0.0.1:8080 --out result/long > result/long.tsv
 docker logs split 2>&1 | grep -a 'split:'      # a split's prefill read and hand-over, one line per request
 ```
 
-`prompts/ctx-N.txt` are the prompts of #4000 and of the issues: N tokens of Strata's docs and sources. Run one
-request at a time, with nothing else on the cards. For a split, the prefill speed is the prompt tokens over the
-read time on its `split:` line; decode comes from the client's TSV.
+`strata bench run` needs a git checkout (or a `COMMIT` file) to report the commit; otherwise the run is marked
+"nonconforming". `long_standard.py` repeats the benchmark's record lines to each length and sends its summary
+question with the runner's own request settings; it is an extension, not part of the protocol. Run one request at a
+time, with nothing else on the cards. For a split, the prefill speed is the prompt tokens over the read time on its
+`split:` line; a split prints that line only for a request that ran to the 512-token cap.
+
+`depth_one.py` and `prompts/ctx-N.txt` (N tokens of Strata's docs and sources) are the client and prompts of #4000
+and of the #3987 and consumer-card issues.
 
 **Smaller consumer cards.** Start `vram_hold.py` on the NVIDIA card before the engine, with
 `16384 - G * 1024 + 115` for a G GB card (16 GB board), and stop it after the engine exits:
